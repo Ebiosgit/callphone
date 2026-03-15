@@ -381,253 +381,209 @@ export default function VoiceCallTrainer({ onBack }) {
   const withTimeout = (promise, ms) =>
     Promise.race([promise, new Promise(resolve => setTimeout(resolve, ms))]);
 
-  // ── TTS ───────────────────────────────────────────────────
-  const speak = async (text, lv) => {
-    currentAudioRef.current?.pause();
-    currentAudioRef.current = null;
+
+  // ── WebAudio & WebSocket (Realtime API) ──
+  const wsRef = useRef(null);
+  const audioCtxRef = useRef(null);
+  const workletNodeRef = useRef(null);
+  const streamRef = useRef(null);
+  const nextPlayTimeRef = useRef(0);
+
+  function arrayBufferToBase64(buffer) {
+    let binary = '';
+    const bytes = new Uint8Array(buffer);
+    const len = bytes.byteLength;
+    for (let i = 0; i < len; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
+  }
+
+  const playAudioChunk = (base64Str) => {
+    if (!audioCtxRef.current) return;
+    const ctx = audioCtxRef.current;
+    if (ctx.state === 'suspended') ctx.resume();
+
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 25000);
-      const res = await fetch("/api/tts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, role: lv?.role }),
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-      if (!res.ok) throw new Error("TTS 실패");
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const audio = new Audio(url);
-      currentAudioRef.current = audio;
-      await withTimeout(new Promise((resolve) => {
-        audio.onended = () => { URL.revokeObjectURL(url); resolve(); };
-        audio.onerror = () => { URL.revokeObjectURL(url); resolve(); };
-        audio.play().catch(resolve);
-      }), 30000);
-    } catch (e) {
-      console.warn("TTS 오류:", e.message);
-      // 서버 TTS 실패 시 그냥 다음으로 진행 (기계음 폴백 제거)
+      const binaryStr = atob(base64Str);
+      const len = binaryStr.length;
+      const pcm16 = new Int16Array(len / 2);
+      for (let i = 0; i < len / 2; i++) {
+        const low = binaryStr.charCodeAt(i * 2);
+        const high = binaryStr.charCodeAt(i * 2 + 1);
+        let value = (high << 8) | low;
+        if (value >= 0x8000) value -= 0x10000;
+        pcm16[i] = value;
+      }
+      const float32 = new Float32Array(pcm16.length);
+      for (let i = 0; i < pcm16.length; i++) float32[i] = pcm16[i] / 32768.0;
+
+      const audioBuffer = ctx.createBuffer(1, float32.length, 24000);
+      audioBuffer.getChannelData(0).set(float32);
+
+      const source = ctx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(ctx.destination);
+
+      const currentTime = ctx.currentTime;
+      const playTime = Math.max(currentTime + 0.05, nextPlayTimeRef.current);
+      source.start(playTime);
+      nextPlayTimeRef.current = playTime + audioBuffer.duration;
+    } catch (e) { console.error('Audio chunk error:', e); }
+  };
+
+  const sendToAI = (history, lv) => {
+    if (wsRef.current && wsRef.current.readyState === 1) {
+      const lastMsg = history[history.length - 1];
+      if (!lastMsg || !lastMsg.content) return;
+      wsRef.current.send(JSON.stringify({
+        type: 'conversation.item.create',
+        item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: lastMsg.content }] }
+      }));
+      wsRef.current.send(JSON.stringify({
+        type: 'response.create',
+        response: { modalities: ['audio', 'text'] }
+      }));
+      setVoiceState('processing');
     }
   };
 
-  // ── AI 응답 ───────────────────────────────────────────────
-  const sendToAI = async (history, lv) => {
-    setVoiceState("processing");
-    let aiText = "잠깐 연결이 불안정하네요.";
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 20000);
-      const res = await fetch("/api/voice", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          systemPrompt: lv.systemPrompt,
-          messages: history.map(m => ({ role: m.role, content: m.content === "[CALL_START]" ? "(전화 연결됨. 지금 바로 첫 인사를 시작하세요.)" : m.content }))
-        }),
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-      const data = await res.json();
-      aiText = data.text || "잠시만요...";
-    } catch (e) {
-      console.warn("AI 응답 오류:", e.message);
-    }
-
-    if (isEndingRef.current) return;
-    const newHistory = [...history, { role: "assistant", content: aiText, time: Date.now() }];
-    historyRef.current = newHistory;
-    setMessages(newHistory);
-    setVoiceState("ai-speaking");
-    await speak(aiText, lv);
-    if (!isEndingRef.current) startListeningLoop(lv, newHistory);
-  };
-
-  // ── 탭 한 번 → 자동 듣기 → 3초 침묵 시 자동 전송 ────────
-  // 모바일: SpeechRecognition.start()는 반드시 사용자 제스처(탭) 안에서 호출해야 함
-  // AI 응답 후 "탭하여 말하기" 버튼 표시 → 탭 → 듣기 시작 → 자동 전송
-
-  const handleTapToSpeak = () => {
-    if (isEndingRef.current || voiceState === "ai-speaking" || voiceState === "processing") return;
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) { setTextMode(true); return; }
-
-    // 이전 인스턴스 정리
-    try { recognitionRef.current?.abort(); } catch {}
-
-    const rec = new SR();
-    rec.lang = "ko-KR";
-    rec.continuous = true;
-    rec.interimResults = true;
-    recognitionRef.current = rec;
-    accumulatedRef.current = "";
-    finalResultsCountRef.current = 0;
-    startTimeRef.current = Date.now();
-
-    rec.onresult = (e) => {
-      if (isEndingRef.current) return;
-      let interim = "", newFinal = "";
-      for (let i = 0; i < e.results.length; i++) {
-        if (e.results[i].isFinal) {
-          // 이미 처리한 final 결과는 건너뜀 (중복 방지)
-          if (i >= finalResultsCountRef.current) {
-            newFinal += e.results[i][0].transcript;
-            finalResultsCountRef.current = i + 1;
-          }
-        } else {
-          interim += e.results[i][0].transcript;
-        }
-      }
-      setInterimTranscript(interim);
-      if (newFinal) {
-        accumulatedRef.current += (accumulatedRef.current ? " " : "") + newFinal;
-        setTranscript(accumulatedRef.current);
-      }
-      // 2초 침묵 시 자동 전송
-      clearTimeout(silenceTimerRef.current);
-      silenceTimerRef.current = setTimeout(() => {
-        if (isEndingRef.current) return;
-        const said = accumulatedRef.current.trim();
-        if (!said) return;
-        const thinkTime = startTimeRef.current ? Date.now() - startTimeRef.current : 0;
-        const userMsg = { role: "user", content: said, time: Date.now(), thinkTime };
-        accumulatedRef.current = "";
-        setTranscript("");
-        setInterimTranscript("");
-        const newHistory = [...historyRef.current, userMsg];
-        historyRef.current = newHistory;
-        setMessages(newHistory);
-        try { rec.stop(); } catch {}
-        sendToAI(newHistory, levelRef.current);
-      }, 2000);
-    };
-
-    rec.onerror = (e) => {
-      console.warn("SpeechRecognition error:", e.error);
-      if (e.error === "not-allowed" || e.error === "permission-denied") {
-        setMicError("마이크 권한이 거부됐어요. 텍스트 입력으로 전환할게요.");
-        setTextMode(true);
-      } else if (e.error === "network") {
-        setMicError("음성 인식 네트워크 오류.");
-      }
-      setVoiceState("idle");
-    };
-
-    rec.onend = () => {
-      if (isEndingRef.current) return;
-      // 누적 텍스트가 있으면 전송
-      const said = accumulatedRef.current.trim();
-      clearTimeout(silenceTimerRef.current);
-      setInterimTranscript("");
-      setTranscript("");
-      accumulatedRef.current = "";
-      recognitionRef.current = null;
-      if (said) {
-        const thinkTime = startTimeRef.current ? Date.now() - startTimeRef.current : 0;
-        const userMsg = { role: "user", content: said, time: Date.now(), thinkTime };
-        const newHistory = [...historyRef.current, userMsg];
-        historyRef.current = newHistory;
-        setMessages(newHistory);
-        sendToAI(newHistory, levelRef.current);
-      } else {
-        setVoiceState("idle");
-      }
-    };
-
-    setVoiceState("listening");
-    try { rec.start(); } catch { setVoiceState("idle"); }
-  };
-
-  // AI 응답 후 → idle 상태로 (탭 대기)
-  const startListeningLoop = (lv, history) => {
-    if (isEndingRef.current) return;
-    levelRef.current = lv;
-    historyRef.current = history;
-    setVoiceState("idle");
-  };
-
-  // ── 전화 시작/끝 ──────────────────────────────────────────
   const startCall = async (lv) => {
     isEndingRef.current = false;
-    isListeningRef.current = false;
-    accumulatedRef.current = "";
-    clearTimeout(silenceTimerRef.current);
-    setLevel(lv); setIsConnecting(true);
-    setMessages([]); setCallDuration(0);
-    setVoiceState("idle"); setTranscript("");
+    setLevel(lv);
+    setIsConnecting(true);
+    setMessages([]);
+    setCallDuration(0);
+    setVoiceState('processing'); // 로딩중
+    setTranscript('');
 
-    setTimeout(async () => {
-      setIsConnecting(false);
-      setScreen("calling");
-      const initHistory = [{ role: "user", content: "[CALL_START]", time: Date.now() }];
-      historyRef.current = initHistory;
-      await sendToAI(initHistory, lv);
-    }, 2000);
+    const isLocalhostDev = window.location.hostname === 'localhost' && window.location.port !== '3001';
+    const wsUrl = isLocalhostDev
+      ? 'ws://localhost:3001'
+      : `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`;
+
+    const ws = new WebSocket(wsUrl);
+    wsRef.current = ws;
+
+    ws.onopen = async () => {
+      // Setup audio capture
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: { sampleRate: 24000, channelCount: 1, echoCancellation: true, noiseSuppression: true }
+        });
+        streamRef.current = stream;
+
+        const audioCtx = new window.AudioContext({ sampleRate: 24000 });
+        audioCtxRef.current = audioCtx;
+        nextPlayTimeRef.current = audioCtx.currentTime;
+
+        await audioCtx.audioWorklet.addModule('/audio-processor.js');
+
+        const source = audioCtx.createMediaStreamSource(stream);
+        const workletNode = new AudioWorkletNode(audioCtx, 'audio-processor');
+        workletNodeRef.current = workletNode;
+
+        workletNode.port.onmessage = (event) => {
+          if (ws.readyState === 1) { // OPEN
+            ws.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: arrayBufferToBase64(event.data) }));
+          }
+        };
+
+        const gainNode = audioCtx.createGain();
+        gainNode.gain.value = 0;
+        source.connect(workletNode).connect(gainNode).connect(audioCtx.destination);
+
+        // Send OpenAI Configuration
+        ws.send(JSON.stringify({
+          type: 'session.update',
+          session: {
+            modalities: ['audio', 'text'],
+            instructions: lv.systemPrompt,
+            voice: 'alloy',
+            input_audio_format: 'pcm16',
+            output_audio_format: 'pcm16',
+            turn_detection: { type: 'server_vad', threshold: 0.5, prefix_padding_ms: 300, silence_duration_ms: 200 }
+          }
+        }));
+
+        // Trigger AI to speak first
+        ws.send(JSON.stringify({
+          type: 'response.create',
+          response: { modalities: ['audio', 'text'], instructions: '여보세요? 인사하세요.' }
+        }));
+
+        setIsConnecting(false);
+        setScreen('calling');
+        setVoiceState('listening'); // User mic is active
+
+      } catch (err) {
+        console.error('Mic error:', err);
+        setMicError('마이크 권한을 허용해주세요.');
+        stopAll();
+      }
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === 'response.audio.delta') {
+          setVoiceState('ai-speaking');
+          playAudioChunk(data.delta);
+        } else if (data.type === 'input_audio_buffer.speech_started') {
+          setVoiceState('listening');
+        } else if (data.type === 'response.done') {
+          setVoiceState('listening');
+        } else if (data.type === 'response.audio_transcript.done') {
+          setMessages(prev => [...prev, { role: 'assistant', content: data.transcript, time: Date.now() }]);
+        } else if (data.type === 'conversation.item.input_audio_transcription.completed') {
+          setMessages(prev => [...prev, { role: 'user', content: data.transcript, time: Date.now() }]);
+        }
+      } catch (e) { }
+    };
+
+    ws.onerror = (err) => {
+      console.error('WebSocket Error:', err);
+      stopAll();
+    };
   };
 
   const stopAll = () => {
     isEndingRef.current = true;
-    isListeningRef.current = false;
-    clearTimeout(silenceTimerRef.current);
-    currentAudioRef.current?.pause();
-    currentAudioRef.current = null;
-    try { recognitionRef.current?.abort(); } catch {}
-    recognitionRef.current = null; // 인스턴스 해제 → 다음 통화에서 새로 생성
-    window.speechSynthesis?.cancel();
+    if (wsRef.current) wsRef.current.close();
+    if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop());
+    if (audioCtxRef.current) audioCtxRef.current.close();
     clearInterval(timerRef.current);
-    stopVolumeMonitor();
-    setVoiceState("idle");
+    setVoiceState('idle');
   };
 
   const endCall = () => {
     stopAll();
-    const result = analyzeConversation(messages, callDuration * 1000);
-    setFeedback(result);
-    setScreen("feedback");
+    setFeedback(null); // Realtime API에서 상세 구조적 분석은 나중에!
+    setScreen('feedback');
   };
 
   const resetAll = () => {
     stopAll();
-    setScreen("home"); setLevel(null); setMessages([]);
-    setFeedback(null); setCallDuration(0); setTranscript(""); setInterimTranscript("");
+    setScreen('home'); setLevel(null); setMessages([]);
+    setFeedback(null); setCallDuration(0); setTranscript(''); setInterimTranscript('');
     setShowCustom(false);
   };
 
   const startCustomCall = () => {
     if (!customTitle.trim() || !customRole.trim() || !customScenario.trim()) return;
-    const isCalling = customDirection === "calling";
+    const isCalling = customDirection === 'calling';
     const customLevel = {
-      id: "custom",
-      emoji: "✏️",
-      title: customTitle.trim(),
-      subtitle: `Lv.${customDifficulty} · 직접 입력`,
-      color: "#F472B6",
-      darkColor: "#DB2777",
-      difficulty: customDifficulty,
-      description: customScenario.trim(),
-      tip: "직접 만든 상황으로 연습해보세요",
-      role: customRole.trim(),
-      scenario: customScenario.trim(),
+      id: 'custom', title: customTitle.trim(), subtitle: `Lv.${customDifficulty} · 직접 입력`,
+      color: '#F472B6', darkColor: '#DB2777', difficulty: customDifficulty,
+      description: customScenario.trim(), tip: '직접 만든 상황으로 연습해보세요', role: customRole.trim(), scenario: customScenario.trim(),
       systemPrompt: isCalling
-        ? `당신은 ${customRole.trim()}입니다. 상대방(사용자)이 지금 당신에게 전화를 걸었습니다.
-규칙:
-- 반드시 한국어로만 짧게(1-3문장) 답변
-- 실제 통화처럼 자연스럽게 응대
-- 처음엔 전화를 받은 사람처럼 자연스럽게 인사 (예: "여보세요?", "안녕하세요, ${customRole.trim()}입니다")
-- 상황: ${customScenario.trim()}
-- 절대 대본/AI 언급 금지`
-        : `당신은 ${customRole.trim()}입니다. 당신이 먼저 상대방(사용자)에게 전화를 건 상황입니다.
-규칙:
-- 반드시 한국어로만 짧게(1-3문장) 답변
-- 실제 통화처럼 자연스럽게 응대
-- 처음엔 전화를 건 사람처럼 자신을 소개하고 용건을 말함 (예: "안녕하세요, 저는 ${customRole.trim()}인데요, ~때문에 연락드렸습니다")
-- 상황: ${customScenario.trim()}
-- 절대 대본/AI 언급 금지`,
+        ? `당신은 ${customRole.trim()}입니다. 상대방이 전화를 걸었습니다. 실제 상황처럼 대답하세요. 상황: ${customScenario.trim()}`
+        : `당신은 ${customRole.trim()}입니다. 먼저 통화를 건 상태입니다. 상황에 맞게 용건을 말하세요. 상황: ${customScenario.trim()}`
     };
     startCall(customLevel);
   };
 
-
+  const handleTapToSpeak = () => { }; // Legacy (button still references it maybe)
   return (
     <div style={{
       fontFamily: "'Plus Jakarta Sans', 'Noto Sans KR', sans-serif", minHeight: "100vh",
@@ -694,7 +650,7 @@ export default function VoiceCallTrainer({ onBack }) {
 
               {/* 말풍선 */}
               <div style={{ position: "absolute", top: "-14px", right: "-8px", background: "white", padding: "12px 14px", borderRadius: "18px", boxShadow: "0 6px 24px rgba(0,0,0,0.12)", border: "2px solid #f1f5f9", maxWidth: "155px", zIndex: 10 }}>
-                <p style={{ fontSize: "13px", fontWeight: "700", color: "#374151", margin: 0, lineHeight: "1.5", textAlign: "center" }}>걱정 마세요,<br/>제가 도와줄게요!</p>
+                <p style={{ fontSize: "13px", fontWeight: "700", color: "#374151", margin: 0, lineHeight: "1.5", textAlign: "center" }}>걱정 마세요,<br />제가 도와줄게요!</p>
                 {/* 말풍선 꼬리 */}
                 <div style={{ position: "absolute", bottom: "-9px", left: "16px", width: "16px", height: "16px", background: "white", border: "2px solid #f1f5f9", borderTop: "none", borderLeft: "none", transform: "rotate(45deg)" }} />
               </div>
@@ -703,11 +659,11 @@ export default function VoiceCallTrainer({ onBack }) {
             {/* 헤드라인 */}
             <div style={{ textAlign: "center" }}>
               <h1 style={{ fontSize: "26px", fontWeight: "900", color: "#1f2937", margin: "0 0 12px", lineHeight: "1.35", letterSpacing: "-0.5px", padding: "0 16px" }}>
-                전화가 무서웠던 나에게,<br/>
+                전화가 무서웠던 나에게,<br />
                 <span style={{ color: "#59ca02" }}>이제 연습할 기회가 생겼다.</span>
               </h1>
               <p style={{ fontSize: "17px", color: "#6b7280", margin: 0, lineHeight: "1.7", fontWeight: "600", padding: "0 24px" }}>
-                AI와 실전처럼 통화하고<br/>자신감을 키워보세요.
+                AI와 실전처럼 통화하고<br />자신감을 키워보세요.
               </p>
             </div>
           </div>
