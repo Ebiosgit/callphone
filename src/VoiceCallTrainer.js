@@ -1,5 +1,5 @@
+/* eslint-disable no-unused-vars */
 import { useState, useEffect, useRef } from "react";
-
 const LEVELS = [
   // ── Lv.1 입문 ──────────────────────────────────────────
   {
